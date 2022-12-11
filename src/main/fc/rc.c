@@ -62,9 +62,13 @@ typedef float (applyRatesFn)(const int axis, float rcCommandf, const float rcCom
 static float oldRcCommand[XYZ_AXIS_COUNT];
 static bool isDuplicate[XYZ_AXIS_COUNT];
 float rcCommandDelta[XYZ_AXIS_COUNT];
+static float duplicateCount[XYZ_AXIS_COUNT];
 #endif
-static float rawSetpoint[XYZ_AXIS_COUNT];
-static float setpointRate[3], rcDeflection[3], rcDeflectionAbs[3];
+static float rawSetpoint[XYZ_AXIS_COUNT], oldRawSetpoint[XYZ_AXIS_COUNT];
+static float rawSetpointVelocity[XYZ_AXIS_COUNT], oldRawSetpointVelocity;
+static float SetpointVelocity[XYZ_AXIS_COUNT];
+static float rawSetpointAcceleration[XYZ_AXIS_COUNT], SetpointAcceleration[XYZ_AXIS_COUNT], oldRawSetpointAcceleration;
+static float setpointRate[XYZ_AXIS_COUNT], rcDeflection[XYZ_AXIS_COUNT], rcDeflectionAbs[XYZ_AXIS_COUNT];
 static bool reverseMotors = false;
 static applyRatesFn *applyRates;
 static uint16_t currentRxRefreshRate;
@@ -136,6 +140,16 @@ float getRcDeflectionAbs(int axis)
 float getRawSetpoint(int axis)
 {
     return rawSetpoint[axis];
+}
+
+float getSetpointVelocity(int axis)
+{
+    return SetpointVelocity[axis];
+}
+
+float getSetpointAcceleration(int axis)
+{
+    return SetpointAcceleration[axis];
 }
 
 float getRcCommandDelta(int axis)
@@ -539,6 +553,13 @@ static FAST_CODE void processRcSmoothingFilter(void)
 }
 #endif // USE_RC_SMOOTHING_FILTER
 
+#ifdef USE_FEEDFORWARD
+float pidGetFeedforwardJitterFactor(void)
+{
+    return pidRuntime.feedforwardJitterFactor;
+}
+#endif //USE_FEEDFORWARD
+
 FAST_CODE void processRcCommand(void)
 {
     if (isRxDataNew) {
@@ -547,52 +568,93 @@ FAST_CODE void processRcCommand(void)
 
 #ifdef USE_FEEDFORWARD
             isDuplicate[axis] = (oldRcCommand[axis] == rcCommand[axis]);
-            rcCommandDelta[axis] = (rcCommand[axis] - oldRcCommand[axis]);
-            oldRcCommand[axis] = rcCommand[axis];
-#endif
-
-            float angleRate;
-            
-#ifdef USE_GPS_RESCUE
-            if ((axis == FD_YAW) && FLIGHT_MODE(GPS_RESCUE_MODE)) {
-                // If GPS Rescue is active then override the setpointRate used in the
-                // pid controller with the value calculated from the desired heading logic.
-                angleRate = gpsRescueGetYawRate();
-                // Treat the stick input as centered to avoid any stick deflection base modifications (like acceleration limit)
-                rcDeflection[axis] = 0;
-                rcDeflectionAbs[axis] = 0;
-            } else
-#endif
-            {
+            // we have movement and should run filters
+            if (!isDuplicate[axis]){
+                //not a duplicate packet, run as normal
+                rcCommandDelta[axis] = (rcCommand[axis] - oldRcCommand[axis]);
+                
+            //feedforward jitter reduction
+            // jitter attenuator falls below 1 when rcCommandDelta falls below jitter threshold
+                float feedforwardJitterFactor = pidGetFeedforwardJitterFactor();
+                float jitterAttenuator = 0.0f;
+                float RcDeltaMag = fabsf(rcCommandDelta[axis]);
+                if (feedforwardJitterFactor) {
+                    if (RcDeltaMag < feedforwardJitterFactor) {
+                        jitterAttenuator = MAX(1.0f - (RcDeltaMag / feedforwardJitterFactor), 0.0f);
+                        jitterAttenuator = 1.0f - jitterAttenuator * jitterAttenuator;
+                    }
+                }
+                rcCommand[axis] = oldRcCommand[axis] + rcCommandDelta[axis] * jitterAttenuator;
+                oldRcCommand[axis] = rcCommand[axis];
                 // scale rcCommandf to range [-1.0, 1.0]
+                float angleRate;
                 float rcCommandf;
                 if (axis == FD_YAW) {
                     rcCommandf = rcCommand[axis] / rcCommandYawDivider;
                 } else {
                     rcCommandf = rcCommand[axis] / rcCommandDivider;
                 }
-
                 rcDeflection[axis] = rcCommandf;
                 const float rcCommandfAbs = fabsf(rcCommandf);
                 rcDeflectionAbs[axis] = rcCommandfAbs;
-
+                //apply rates
                 angleRate = applyRates(axis, rcCommandf, rcCommandfAbs);
-
+                oldRawSetpoint[axis] = rawSetpoint[axis];
+                rawSetpoint[axis] = constrainf(angleRate, -1.0f * currentControlRateProfile->rate_limit[axis], 1.0f * currentControlRateProfile->rate_limit[axis]);
+                DEBUG_SET(DEBUG_ANGLERATE, axis, lrintf(angleRate));
+                //calculate raw setpoint velocity and acceleration and apply PT1 derivative filters at RC rate
+                const float rxRate = 1e6f / getCurrentRxRefreshRate();
+                const float feedforwardSmoothFactor = pidGetFeedforwardSmoothFactor();
+                oldRawSetpointVelocity = rawSetpointVelocity[axis];
+                rawSetpointVelocity[axis] = (rawSetpoint[axis] - oldRawSetpoint[axis]) * rxRate;
+                if (duplicateCount[axis]) {
+                    rawSetpointVelocity[axis] /= duplicateCount[axis] + 1;
+                }
+                rawSetpointVelocity[axis] = oldRawSetpointVelocity + (rawSetpointVelocity[axis] - oldRawSetpointVelocity) * feedforwardSmoothFactor;
+                oldRawSetpointAcceleration = rawSetpointAcceleration[axis];
+                rawSetpointAcceleration[axis] = (rawSetpointVelocity[axis] - oldRawSetpointVelocity) * rxRate;
+                rawSetpointAcceleration[axis] = oldRawSetpointAcceleration + (rawSetpointAcceleration[axis] - oldRawSetpointAcceleration) * feedforwardSmoothFactor;
+            } else {
+                // no movement
+                if (duplicateCount[axis]) {
+                    // increment duplicate count to max of 2
+                    duplicateCount[axis] += (duplicateCount[axis] < 2) ? 1 : 0;
+                    // second or subsequent duplicate, or duplicate when held at max stick or centre position.
+                    // force feedforward to zero
+                    rawSetpointVelocity[axis] = 0.0f;
+                    rawSetpointAcceleration[axis] = 0.0f;
+                    // zero speed and acceleration for correct smoothing of next good packet
+                } else {
+                    // first duplicate; hold feedforward and previous static values, as if we just never got anything
+                    duplicateCount[axis] = 1;   
+                }
             }
-            rawSetpoint[axis] = constrainf(angleRate, -1.0f * currentControlRateProfile->rate_limit[axis], 1.0f * currentControlRateProfile->rate_limit[axis]);
-            DEBUG_SET(DEBUG_ANGLERATE, axis, lrintf(angleRate));
-        }
+#endif //USE_FEEDFORWARD
+
+#ifdef USE_GPS_RESCUE
+            if ((axis == FD_YAW) && FLIGHT_MODE(GPS_RESCUE_MODE)) {
+                // If GPS Rescue is active then override the setpointRate used in the
+                // pid controller with the value calculated from the desired heading logic.
+                rawSetpoint[axis] = gpsRescueGetYawRate();
+                // Treat the stick input as centered to avoid any stick deflection base modifications (like acceleration limit)
+                rcDeflection[axis] = 0;
+                rcDeflectionAbs[axis] = 0;
+                rawSetpointVelocity[axis] = 0;
+                rawSetpointAcceleration[axis] = 0;
+            }
+#endif
         // adjust raw setpoint steps to camera angle (mixing Roll and Yaw)
-        if (rxConfig()->fpvCamAngleDegrees && IS_RC_MODE_ACTIVE(BOXFPVANGLEMIX) && !FLIGHT_MODE(HEADFREE_MODE)) {
-            scaleRawSetpointToFpvCamAngle();
+            if (rxConfig()->fpvCamAngleDegrees && IS_RC_MODE_ACTIVE(BOXFPVANGLEMIX) && !FLIGHT_MODE(HEADFREE_MODE)) {
+                scaleRawSetpointToFpvCamAngle();
+            }
         }
-    }
 
 #ifdef USE_RC_SMOOTHING_FILTER
-    processRcSmoothingFilter();
+        processRcSmoothingFilter();
 #endif
 
-    isRxDataNew = false;
+        isRxDataNew = false;
+    }
 }
 
 FAST_CODE_NOINLINE void updateRcCommands(void)
